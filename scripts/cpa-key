@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""CLIProxyAPI 客户端 api-key 管理（access.api-keys），按标签添加 / 吊销。
+
+用法:
+  cpa-key list [--show]
+  cpa-key add <label> [备注]
+  cpa-key rm <label>
+  cpa-key test <label|--all>
+
+环境变量:
+  CPA_CONFIG       配置文件路径（默认 ~/.config/cliproxyapi/config.yaml）
+  CPA_SERVICE      systemd 用户服务名（默认 cliproxyapi）
+  CPA_VERIFY_URL   验活地址（默认 http://127.0.0.1:8317，走本机回环最省事）
+  CPA_CA_FILE      HTTPS 时用的 CA（默认 ~/.config/cliproxyapi/tls/ca.crt）
+"""
+import datetime
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+CFG = pathlib.Path(os.environ.get("CPA_CONFIG", pathlib.Path.home() / ".config/cliproxyapi/config.yaml")).expanduser()
+SERVICE = os.environ.get("CPA_SERVICE", "cliproxyapi")
+VERIFY_URL = os.environ.get("CPA_VERIFY_URL", "http://127.0.0.1:8317").rstrip("/") + "/v1/models"
+CA = pathlib.Path(os.environ.get("CPA_CA_FILE", pathlib.Path.home() / ".config/cliproxyapi/tls/ca.crt")).expanduser()
+
+COMMENT_RE = re.compile(r'^(\s*)#\s*([\w.\-]+)\s*[—-]?\s*(.*)$')
+KEY_RE = re.compile(r'^\s*-\s*"(sk-[^"]+)"\s*$')
+
+
+def load_lines():
+    if not CFG.exists():
+        sys.exit(f"配置不存在: {CFG}")
+    return CFG.read_text().splitlines()
+
+
+def find_block(lines):
+    """返回 access.api-keys 里的条目 [(label, key_idx, key)] 和列表末尾行号。"""
+    start = next((i for i, l in enumerate(lines) if re.match(r'^access:\s*$', l)), None)
+    if start is None:
+        sys.exit("配置里找不到 access: 段")
+    kstart = next((i for i, l in enumerate(lines[start:start + 15], start)
+                   if re.match(r'^\s+api-keys:\s*$', l)), None)
+    if kstart is None:
+        sys.exit("access: 段里找不到 api-keys:")
+    entries, end, i, pending = [], kstart, kstart + 1, None
+    while i < len(lines) and re.match(r'^\s*(|-(?: |$)|#)', lines[i]):
+        m_k = KEY_RE.match(lines[i])
+        m_c = COMMENT_RE.match(lines[i])
+        if m_k:
+            entries.append((pending or f"key{len(entries) + 1}", i, m_k.group(1)))
+            pending, end = None, i
+        elif m_c:
+            pending = m_c.group(2)
+        i += 1
+    return entries, end
+
+
+def wait_ready(timeout=30):
+    for _ in range(timeout * 2):
+        r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "2",
+                            "http://127.0.0.1:8317/v1/models"], capture_output=True, text=True)
+        if r.stdout.strip() not in ("000", ""):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def restart_and_wait():
+    subprocess.run(["systemctl", "--user", "restart", SERVICE], check=True)
+    if not wait_ready():
+        sys.exit("服务重启后 30s 内未就绪，检查: journalctl --user -u " + SERVICE)
+    time.sleep(1)
+    print(f"服务已重启并就绪: {SERVICE}")
+
+
+def mask(k):
+    return f"{k[:10]}…{k[-4:]}" if len(k) > 20 else k
+
+
+def verify(key, label):
+    cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "20", VERIFY_URL,
+           "-H", f"Authorization: Bearer {key}"]
+    if VERIFY_URL.startswith("https://") and CA.exists():
+        cmd[1:1] = ["--cacert", str(CA)]
+    code = subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    print(f"验证 {label} -> HTTP {code}  (200 = 可用)")
+    return 0 if code == "200" else 1
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    cmd, args = sys.argv[1], sys.argv[2:]
+
+    if cmd == "list":
+        entries, _ = find_block(load_lines())
+        if not entries:
+            return print("当前没有任何 key")
+        show = "--show" in args
+        w = max(len(e[0]) for e in entries)
+        print(f"{'标签'.ljust(w)}  密钥")
+        for label, _, key in entries:
+            print(f"{label.ljust(w)}  {key if show else mask(key)}")
+
+    elif cmd == "add":
+        if not args:
+            sys.exit("用法: cpa-key add <label> [备注]")
+        label, note = args[0], " ".join(args[1:]) or "未备注"
+        lines = load_lines()
+        entries, end = find_block(lines)
+        if any(e[0] == label for e in entries):
+            sys.exit(f"标签已存在: {label}")
+        key = "sk-" + subprocess.check_output(["openssl", "rand", "-hex", "24"], text=True).strip()
+        lines[end + 1:end + 1] = [f'    # {label} — {note}（{datetime.date.today()} 添加）',
+                                  f'    - "{key}"']
+        CFG.write_text("\n".join(lines) + "\n")
+        print(f"已添加 {label}: {key}")
+        restart_and_wait()
+        sys.exit(verify(key, label))
+
+    elif cmd == "rm":
+        if not args:
+            sys.exit("用法: cpa-key rm <label>")
+        label = args[0]
+        lines = load_lines()
+        entries, _ = find_block(lines)
+        hit = next((e for e in entries if e[0] == label), None)
+        if not hit:
+            sys.exit(f"没有这个标签: {label}")
+        _, kidx, key = hit
+        drop = [kidx]
+        if kidx - 1 >= 0 and label in lines[kidx - 1] and lines[kidx - 1].lstrip().startswith("#"):
+            drop.append(kidx - 1)
+        for idx in sorted(drop, reverse=True):
+            del lines[idx]
+        CFG.write_text("\n".join(lines) + "\n")
+        print(f"已吊销 {label} ({mask(key)})")
+        restart_and_wait()
+
+    elif cmd == "test":
+        entries, _ = find_block(load_lines())
+        targets = entries if (not args or args[0] == "--all") else [e for e in entries if e[0] == args[0]]
+        if not targets:
+            sys.exit("没有匹配的 key")
+        bad = sum(verify(k, l) for l, _, k in targets)
+        sys.exit(1 if bad else 0)
+
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main()

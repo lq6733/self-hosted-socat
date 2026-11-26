@@ -1,0 +1,20 @@
+# 凭据与证书，永远不要提交
+tls/
+auth/
+*.json
+!package.json
+config.yaml
+config.yaml.bak.*
+*.bak.*
+client.env
+*.pem
+*.key
+*.crt
+*.csr
+*.srl
+
+# 本地临时
+*.log
+*.tmp
+__pycache__/
+.DS_Store

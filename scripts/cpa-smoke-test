@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# CPA 全链路冒烟测试：服务 / 端口 / 凭据 / 客户端 key / 模型列表 / 真实对话 / 流式 / 鉴权拒绝
+#
+#   cpa-smoke-test            # 全部检查（会真实消耗少量上游额度）
+#   cpa-smoke-test --quick    # 跳过真实调用
+#   CPA_BASE_URL=... CPA_CA_FILE=... cpa-smoke-test
+#
+# 环境变量:
+#   CPA_BASE_URL   客户端入口（默认 https://$(tailscale ip -4):8443）
+#   CPA_CA_FILE    自签 CA（默认 ~/.config/cliproxyapi/tls/ca.crt）
+#   CPA_CONFIG     配置文件（用于取一条客户端 key）
+#   CPA_TEST_MODEL 指定测试模型
+set -uo pipefail
+
+CFG="${CPA_CONFIG:-$HOME/.config/cliproxyapi/config.yaml}"
+CA="${CPA_CA_FILE:-$HOME/.config/cliproxyapi/tls/ca.crt}"
+AUTH_DIR="${CPA_AUTH_DIR:-$HOME/.config/cliproxyapi/auth}"
+BASE="${CPA_BASE_URL:-https://$(tailscale ip -4 2>/dev/null | head -1):8443}"
+MODEL="${CPA_TEST_MODEL:-}"
+QUICK=0
+[ "${1:-}" = "--quick" ] && QUICK=1
+
+pass=0; fail=0
+ok()    { printf '  \033[32m✓\033[0m %s\n' "$*"; pass=$((pass+1)); }
+bad()   { printf '  \033[31m✗\033[0m %s\n' "$*"; fail=$((fail+1)); }
+warn()  { printf '  \033[33m!\033[0m %s\n' "$*"; }
+head_() { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+curl_() {
+  if [[ "$BASE" == https://* ]]; then curl -s --cacert "$CA" "$@"; else curl -s "$@"; fi
+}
+
+KEY="$(grep -oE '"sk-[^"]+"' "$CFG" 2>/dev/null | head -1 | tr -d '"')"
+[ -z "$KEY" ] && { echo "找不到客户端 api-key（$CFG）"; exit 2; }
+
+head_ "1. 用户服务"
+for s in cliproxyapi cpa-tls; do
+  [ "$(systemctl --user is-active "$s" 2>/dev/null)" = active ] && ok "$s active" || bad "$s 未运行"
+  [ "$(systemctl --user is-enabled "$s" 2>/dev/null)" = enabled ] && ok "$s 开机自启" || bad "$s 未设自启"
+done
+[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" = yes ] \
+  && ok "linger 已开（退出登录仍运行）" || bad "linger 未开：loginctl enable-linger $USER"
+
+head_ "2. 监听面"
+ss -tln 2>/dev/null | grep -q "127.0.0.1:8317" && ok "CPA 监听 127.0.0.1:8317" || bad "8317 未监听"
+ss -tln 2>/dev/null | grep -qE "0\.0\.0\.0:8317|\*:8317" \
+  && bad "8317 暴露在非回环地址（server.host 应为 127.0.0.1）" || ok "8317 未暴露"
+ss -tln 2>/dev/null | grep -qE ":8443" && ok "8443 TLS 前置在监听" || bad "8443 未监听"
+
+head_ "3. 凭据"
+n=$(find "$AUTH_DIR" -maxdepth 1 -name "*.json" ! -name "*.bak.*" 2>/dev/null | wc -l)
+[ "$n" -gt 0 ] && ok "$n 个认证文件" || bad "没有认证文件"
+for f in "$AUTH_DIR"/*.json; do
+  [ -e "$f" ] || continue
+  case "$f" in *.bak.*) continue ;; esac
+  who=$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d.get("email") or d.get("type"))' "$f" 2>/dev/null || echo "?")
+  dis=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("disabled",False))' "$f" 2>/dev/null || echo "?")
+  [ "$dis" = "True" ] && warn "$who 已被禁用(disabled=true)" || ok "$who"
+done
+
+head_ "4. 模型列表"
+models=$(curl_ -m 20 "$BASE/v1/models" -H "Authorization: Bearer $KEY" \
+  | python3 -c 'import json,sys;print(len(json.load(sys.stdin).get("data",[])))' 2>/dev/null || echo 0)
+[ "${models:-0}" -gt 0 ] && ok "可见 $models 个模型" || bad "模型列表为空（凭据未加载？）"
+
+head_ "5. 鉴权拒绝"
+[ "$(curl_ -o /dev/null -w '%{http_code}' -m 15 "$BASE/v1/models")" = "401" ] \
+  && ok "无 key → 401" || bad "无 key 未返回 401"
+[ "$(curl_ -o /dev/null -w '%{http_code}' -m 15 "$BASE/v1/models" -H "Authorization: Bearer sk-invalid")" = "401" ] \
+  && ok "错误 key → 401" || bad "错误 key 未被拒绝"
+
+if [ "$QUICK" = 0 ]; then
+  # 客户端模型的目录会随时变（且部分档位不支持 ChatGPT 账号），所以按优先级逐个试
+  cands=$(curl_ -m 20 "$BASE/v1/models" -H "Authorization: Bearer $KEY" | python3 -c '
+import json,sys
+ids=[m["id"] for m in json.load(sys.stdin).get("data",[])]
+skip=("image","audio","video","embed","review")
+ids=[i for i in ids if not any(s in i for s in skip)]
+pref=[i for i in ids if "luna" in i or "mini" in i]
+seen=set(); out=[]
+for i in pref+ids:
+    if i not in seen:
+        seen.add(i); out.append(i)
+print("\n".join(out[:6]))' 2>/dev/null)
+  [ -n "$MODEL" ] && cands="$MODEL"
+
+  head_ "6. 真实对话（非流式，自动选一个可用模型）"
+  WORK_MODEL=""; tried=0
+  while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    [ -n "$WORK_MODEL" ] && break
+    resp=$(curl_ -m 90 "$BASE/v1/chat/completions" -H "Authorization: Bearer $KEY" \
+      -H "Content-Type: application/json" \
+      -d "{\"model\":\"$m\",\"messages\":[{\"role\":\"user\",\"content\":\"只回答两个字：收到\"}],\"max_tokens\":24}")
+    if echo "$resp" | grep -q '"error"'; then
+      msg=$(echo "$resp" | python3 -c 'import json,sys;e=json.load(sys.stdin).get("error",{});print(str(e.get("code"))+" "+str(e.get("message"))[:80])' 2>/dev/null)
+      case "$msg" in
+        *model_not_found*|*not\ supported*)
+          warn "$m 不被该账号支持，试下一个"; tried=$((tried+1))
+          [ "$tried" -ge 4 ] && { bad "连续 4 个模型都不可用（最后一个: $msg）"; }
+          ;;
+        *) bad "调用失败 [$m]: $msg"; break ;;
+      esac
+    else
+      WORK_MODEL="$m"
+      ok "$m 回复: $(echo "$resp" | python3 -c 'import json,sys;print((json.load(sys.stdin).get("choices") or [{}])[0].get("message",{}).get("content","").strip()[:30])' 2>/dev/null)"
+    fi
+  done <<< "$cands"
+  [ -z "$WORK_MODEL" ] && [ "$tried" -lt 4 ] && [ "$fail" -eq 0 ] && bad "没有可用模型"
+
+  if [ -n "$WORK_MODEL" ]; then
+    head_ "7. 流式 SSE（model=$WORK_MODEL）"
+    tmp="$(mktemp)"
+    curl_ -N -m 90 "$BASE/v1/chat/completions" -H "Authorization: Bearer $KEY" \
+      -H "Content-Type: application/json" \
+      -d "{\"model\":\"$WORK_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"数到三\"}],\"stream\":true,\"max_tokens\":32}" \
+      -o "$tmp" -w '  ttfb=%{time_starttransfer}s total=%{time_total}s\n'
+    chunks=$(grep -c '^data:' "$tmp" 2>/dev/null || true)
+    chunks=${chunks:-0}
+    if [ "$chunks" -gt 1 ]; then
+      ok "收到 $chunks 个 SSE 分片（未被缓冲）"
+    else
+      err=$(python3 -c 'import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(0)
+e=d.get("error") or {}
+print(f"{e.get(\"code\") or e.get(\"type\")}: {str(e.get(\"message\"))[:140]}")' "$tmp" 2>/dev/null || true)
+      if [ -n "$err" ]; then bad "流式请求失败（上游）: $err"; else bad "SSE 分片数异常: $chunks"; fi
+    fi
+    rm -f "$tmp"
+  fi
+fi
+
+printf '\n\033[1m结果: %d 通过, %d 失败\033[0m\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

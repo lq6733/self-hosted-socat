@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""把 Codex 认证文件导入 CLIProxyAPI（auth-dir）：自动转换格式、备份旧文件、热加载并验活。
+
+支持两种输入：
+  1) CPA 原生格式 : {"type":"codex","access_token":...,"refresh_token":...}
+  2) codex CLI 格式: {"OPENAI_API_KEY":null,"tokens":{"id_token","access_token",
+                      "refresh_token","account_id"},"last_refresh":...}
+
+用法:
+  cpa-import-codex <file.json> [--email x@y] [--priority N] [--dry-run] [--no-verify]
+  cpa-import-codex --rotate-check      # 只检查现有凭据是否还能用
+
+环境变量:
+  CPA_AUTH_DIR     默认 ~/.config/cliproxyapi/auth
+  CPA_CONFIG       默认 ~/.config/cliproxyapi/config.yaml（用于取一条客户端 key 做验活）
+  CPA_VERIFY_URL   默认 http://127.0.0.1:8317
+  CPA_CA_FILE      HTTPS 验活时的 CA，默认 ~/.config/cliproxyapi/tls/ca.crt
+
+导入后服务会自动热加载（auth 目录有文件监听），不需要重启。
+"""
+import argparse
+import base64
+import datetime
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = pathlib.Path.home()
+AUTH_DIR = pathlib.Path(os.environ.get("CPA_AUTH_DIR", HOME / ".config/cliproxyapi/auth")).expanduser()
+CFG = pathlib.Path(os.environ.get("CPA_CONFIG", HOME / ".config/cliproxyapi/config.yaml")).expanduser()
+BASE = os.environ.get("CPA_VERIFY_URL", "http://127.0.0.1:8317").rstrip("/")
+CA = pathlib.Path(os.environ.get("CPA_CA_FILE", HOME / ".config/cliproxyapi/tls/ca.crt")).expanduser()
+
+
+def die(msg):
+    print(f"✗ {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def jwt_claims(token):
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return {}
+
+
+def norm(src):
+    d = json.loads(pathlib.Path(src).read_text())
+    if isinstance(d, dict) and isinstance(d.get("tokens"), dict):
+        t = d["tokens"]
+        out = {"type": "codex",
+               "access_token": t.get("access_token", ""),
+               "refresh_token": t.get("refresh_token", ""),
+               "id_token": t.get("id_token") or "",
+               "account_id": t.get("account_id") or "",
+               "last_refresh": d.get("last_refresh") or ""}
+        origin = "codex-cli"
+    elif isinstance(d, dict) and d.get("type") == "codex" and "access_token" in d:
+        out, origin = dict(d), "cpa"
+    else:
+        keys = ", ".join(d.keys()) if isinstance(d, dict) else type(d).__name__
+        die(f"无法识别的格式（顶层字段: {keys}）")
+    if not out.get("access_token"):
+        die("access_token 为空")
+    out.setdefault("disabled", False)
+    out.setdefault("priority", -1)
+    return out, origin
+
+
+def enrich(out, email_override):
+    c = jwt_claims(out["access_token"])
+    ns = c.get("https://api.openai.com/auth") or {}
+    prof = c.get("https://api.openai.com/profile") or {}
+    if not out.get("account_id"):
+        out["account_id"] = ns.get("chatgpt_account_id", "")
+    if not out.get("expired") and c.get("exp"):
+        out["expired"] = str(c["exp"])
+    email = email_override or out.get("email") or prof.get("email")
+    if not email and out.get("id_token"):
+        ic = jwt_claims(out["id_token"])
+        email = ic.get("email") or (ic.get("https://api.openai.com/profile") or {}).get("email")
+    if not email:
+        die("无法解析邮箱，请用 --email 指定（只影响文件名）")
+    out["email"] = email
+    out.setdefault("id_token", "")
+    out.setdefault("last_refresh", "")
+    exp = out.get("expired", "")
+    meta = {"plan": ns.get("chatgpt_plan_type", "?"),
+            "account": (out.get("account_id") or "")[:8] + "…",
+            "expires": datetime.datetime.fromtimestamp(int(exp)).strftime("%F %T") if exp.isdigit() else "未知"}
+    return out, meta
+
+
+def curl(args, timeout=90):
+    cmd = ["curl", "-s", "-m", str(timeout)]
+    if BASE.startswith("https://") and CA.exists():
+        cmd += ["--cacert", str(CA)]
+    return subprocess.run(cmd + args, capture_output=True, text=True).stdout
+
+
+def client_key():
+    try:
+        for line in CFG.read_text().splitlines():
+            s = line.strip()
+            if s.startswith('- "sk-'):
+                return s.split('"')[1]
+    except Exception:
+        pass
+    return None
+
+
+def wait_ready(timeout=40):
+    for _ in range(timeout * 2):
+        r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "2",
+                            f"{BASE}/v1/models"], capture_output=True, text=True)
+        if r.stdout.strip() not in ("000", ""):
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def verify(model=None):
+    key = client_key()
+    if not key:
+        print("  ! 找不到客户端 api-key，跳过验活")
+        return None
+    try:
+        ids = [m["id"] for m in json.loads(curl([f"{BASE}/v1/models", "-H", f"Authorization: Bearer {key}"], 20))["data"]]
+    except Exception:
+        print("  ! 取不到模型列表（凭据可能还没加载）")
+        return False
+    if not ids:
+        print("  ! 模型列表为空")
+        return False
+    m = model or next((i for i in ids if i.startswith("gpt-5") and "image" not in i), ids[0])
+    body = curl([f"{BASE}/v1/chat/completions", "-H", f"Authorization: Bearer {key}",
+                 "-H", "Content-Type: application/json", "-d",
+                 json.dumps({"model": m, "messages": [{"role": "user", "content": "只回答两个字：收到"}],
+                             "max_tokens": 24})])
+    try:
+        j = json.loads(body)
+    except Exception:
+        print(f"  ! 响应无法解析: {body[:160]}")
+        return False
+    if "error" in j:
+        e = j["error"]
+        print(f"  ✗ 调用失败: {e.get('code') or e.get('type')} — {str(e.get('message'))[:120]}")
+        return False
+    txt = (j.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    print(f"  ✓ 真实调用成功（model={m}）回复: {txt.strip()[:40]!r}")
+    return True
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("file", nargs="?")
+    ap.add_argument("--email")
+    ap.add_argument("--priority", type=int)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-verify", action="store_true")
+    ap.add_argument("--rotate-check", action="store_true")
+    a = ap.parse_args()
+
+    if a.rotate_check:
+        print("检查现有凭据可用性…")
+        sys.exit(0 if verify() else 1)
+    if not a.file:
+        ap.print_help()
+        sys.exit(2)
+
+    out, origin = norm(a.file)
+    out, meta = enrich(out, a.email)
+    if a.priority is not None:
+        out["priority"] = a.priority
+
+    print(f"来源格式 : {origin}")
+    print(f"邮箱     : {out['email']}")
+    print(f"账号     : {meta['account']}   计划: {meta['plan']}")
+    print(f"令牌到期 : {meta['expires']}")
+
+    dest = AUTH_DIR / f"{out['email']}.json"
+    if a.dry_run:
+        print(f"\n(dry-run) 未写入。目标: {dest}")
+        return
+
+    AUTH_DIR.mkdir(parents=True, exist_ok=True)
+    AUTH_DIR.chmod(0o700)
+    if dest.exists():
+        bak = dest.with_suffix(f".json.bak.{datetime.datetime.now():%Y%m%d%H%M%S}")
+        shutil.move(dest, bak)
+        print(f"旧文件已备份: {bak.name}")
+    dest.write_text(json.dumps(out, ensure_ascii=False, indent=2))
+    dest.chmod(0o600)
+    print(f"已写入: {dest}")
+
+    if not wait_ready():
+        die("服务未就绪")
+    time.sleep(3)
+    if not a.no_verify and verify() is False:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

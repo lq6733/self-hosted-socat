@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# CPA 的 Tailscale TLS 前置：只在 tailnet IP 上监听 8443，终结 TLS 后回源到本机 8317。
+# 由 systemd 用户服务 cpa-tls.service 调用；IP 从 tailscale 动态取，换网络不用改 unit。
+#
+# 可覆盖的环境变量：
+#   CPA_TLS_PORT   监听端口（默认 8443）
+#   CPA_BACKEND    回源地址（默认 127.0.0.1:8317）
+#   CPA_TLS_DIR    证书目录（默认 ~/.config/cliproxyapi/tls）
+#   CPA_BIND_IP    强制指定监听 IP（默认取 tailscale ip -4 的第一个）
+set -euo pipefail
+
+TLS_DIR="${CPA_TLS_DIR:-$HOME/.config/cliproxyapi/tls}"
+PORT="${CPA_TLS_PORT:-8443}"
+BACKEND="${CPA_BACKEND:-127.0.0.1:8317}"
+BIND_IP="${CPA_BIND_IP:-$(tailscale ip -4 2>/dev/null | head -n1 || true)}"
+
+[ -z "$BIND_IP" ] && { echo "tailscale 尚未就绪，未拿到 tailnet IPv4" >&2; exit 1; }
+[ -r "$TLS_DIR/fullchain.pem" ] || { echo "证书缺失: $TLS_DIR/fullchain.pem" >&2; exit 1; }
+[ -r "$TLS_DIR/server.key" ]   || { echo "私钥缺失: $TLS_DIR/server.key" >&2; exit 1; }
+
+echo "listen https://$BIND_IP:$PORT -> $BACKEND"
+exec socat -d \
+  OPENSSL-LISTEN:"$PORT",bind="$BIND_IP",fork,reuseaddr,verify=0,cert="$TLS_DIR/fullchain.pem",key="$TLS_DIR/server.key" \
+  TCP:"$BACKEND"
