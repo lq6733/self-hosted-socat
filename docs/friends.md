@@ -1,96 +1,73 @@
 # 接入指南（给朋友）
 
-> 我的 AI 中转配置说明。你只需要跟着做完这 6 步，大约 5 分钟。
+> 我的 AI 中转配置说明。跟着做完 5 步，大约 3 分钟。
 > 遇到问题先看最后的「常见报错」，还不行就把报错截图发我。
 
 **我提供给你的两样东西：**
 
 | | 示例 | 说明 |
 |---|---|---|
-| 服务器地址 | `100.x.y.z` | 我 tailnet 里那台机器的 IP |
+| Base URL | `https://node.tailxxxx.ts.net` | 没有端口号，末尾不要加 `/v1` |
 | 你的 API Key | `sk-xxxxxxxx` | 每人一把，各不相同 |
+
+**不需要做的事**：不用装证书、不用配代理、不用改系统设置。
 
 ---
 
 ## 第 1 步：加入我的 tailnet
 
-tailnet 相当于一个「私有局域网」，只有被邀请的设备之间能互相访问，公网上看不到这台机器。
+tailnet 相当于一个「私有局域网」，只有被邀请的设备能互相访问，公网上看不到这台机器。
 
 1. 点我发你的 **Tailscale 邀请链接**，登录（Google / GitHub / Microsoft 账号都行）
-2. 装客户端：<https://tailscale.com/download>（Windows / macOS / Linux / 手机都有）
-3. 用同一个账号登录，看到设备列表里有我的机器和你自己的设备，就算通了
+2. 装客户端：<https://tailscale.com/download>
+3. 用同一账号登录，看到设备列表里有我的机器和你自己的设备，就算通了
 
-## 第 2 步：确认网络能通
-
-```bash
-ping 100.x.y.z
-```
-
-- 能 ping 通 → 进第 3 步
-- 不通 → 看 Tailscale 客户端是不是显示 `Connected`；公司或校园网可能挡 UDP，会自动走中继（速度慢一点但能用）
-
-## 第 3 步：一条命令初始化（Linux / macOS）
+## 第 2 步：确认能解析到我的机器
 
 ```bash
-curl -O https://raw.githubusercontent.com/lq6733/self-hosted-socat/main/scripts/laptop-setup.sh
-bash laptop-setup.sh 100.x.y.z sk-xxxxxxxx
+ping -c1 node.tailxxxx.ts.net
 ```
 
-它会自动完成：
+能解析到 `100.x.y.z` 就继续。
 
-1. 从我服务器拉取自签证书（并校验是不是我签发的，防中间人）
-2. 装进系统信任库（自动识别 Arch / Debian / Fedora 系）
-3. 装进浏览器（Chromium / Firefox，需要 `certutil`）
-4. 写好 `~/.config/cpa/client.env`
-5. 用你的 key 发一个真实请求验活
+**如果解析不了**（公司网络或本地代理会干扰 MagicDNS），加一行 hosts 即可，效果完全一样：
 
-看到这行就成功了：
+```bash
+# Linux / macOS
+echo "100.x.y.z node.tailxxxx.ts.net" | sudo tee -a /etc/hosts
 
-```
-✓ API KEY 可用（HTTP 200）
+# Windows（管理员 PowerShell）
+Add-Content C:\Windows\System32\drivers\etc\hosts "100.x.y.z node.tailxxxx.ts.net"
 ```
 
-> **Windows 用户**：可以装 WSL 跑上面的命令；或者手动双击 `ca.crt` 导入到「受信任的根证书颁发机构」。
+## 第 3 步：验证一次（可选，但建议）
+
+```bash
+curl https://node.tailxxxx.ts.net/v1/models \
+  -H "Authorization: Bearer sk-你的key"
+```
+
+返回一大串模型名就通了。返回 `401` 说明 key 不对；超时说明第 1/2 步没过。
+
+> 证书是 Let's Encrypt 签的，系统默认信任，**不要**加 `-k`，加了反而看不出问题。
 
 ## 第 4 步：配置你的客户端
 
-```bash
-source ~/.config/cpa/client.env
-```
-
 | 客户端 | 怎么配 |
 |---|---|
-| **Claude Code** | 不用额外配，它自动读 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` |
-| **Codex CLI** | 同上（读 `OPENAI_BASE_URL` / `OPENAI_API_KEY`） |
-| **任意 OpenAI SDK** | `base_url = https://100.x.y.z:8443/v1`，`api_key = sk-xxxxxxxx` |
-| **Cherry Studio / LobeChat / OpenWebUI** | Base URL 填 `https://100.x.y.z:8443/v1`，模型填 `gpt-6-luna` |
+| **CCS** | Base URL 填上表那个地址，API Key 填你的 key，模型名填 `gpt-6-luna`（或用 `/v1/models` 里的任意 `gpt-*`） |
+| **Claude Code** | `export ANTHROPIC_BASE_URL=https://node.tailxxxx.ts.net`、`export ANTHROPIC_AUTH_TOKEN=sk-...` |
+| **Codex CLI** | `export OPENAI_BASE_URL=https://node.tailxxxx.ts.net/v1`、`export OPENAI_API_KEY=sk-...` |
+| **任意 OpenAI SDK** | `base_url=.../v1`，`api_key=sk-...` |
+| **Cherry Studio / LobeChat / OpenWebUI** | Base URL 填 `.../v1`，模型填 `gpt-6-luna` |
 
-模型名填哪个？先看有哪些：
+注意两种前缀习惯：**OpenAI 系要 `.../v1`，Anthropic 系不要**（Claude Code 自己会拼 `/v1/messages`）。
 
-```bash
-curl --cacert $CPA_CA_FILE $OPENAI_BASE_URL/models \
-  -H "Authorization: Bearer $OPENAI_API_KEY"
-```
+## 第 5 步：三条规矩
 
-挑带 `luna` / `mini` 的档位最稳（其它档位可能对你的账号类型不支持）。
-
-## 第 5 步：手动验证一次
-
-```bash
-source ~/.config/cpa/client.env
-curl --cacert $CPA_CA_FILE $OPENAI_BASE_URL/chat/completions \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-6-luna","messages":[{"role":"user","content":"说句话"}],"max_tokens":32}'
-```
-
-返回带 `"content"` 的 JSON 就一切正常。
-
-## 第 6 步：三条规矩
-
-1. **key 不要外传**。一人一把，我把你的那把吊销了你就断了，不会影响别人。
+1. **key 不要外传**。一人一把，吊销你那把只会影响你自己，不会连累别人。
 2. **只用 API，不要问管理面板密码**。面板只有我能进。
-3. **省着用**。上游是免费/共享额度，批量翻译、贴大文件、跑长任务很容易触发限流（会有 `retry-after`，等几百秒才恢复）。
+3. **省着用**。上游是免费/共享额度，批量翻译、贴大文件、跑长任务很容易触发限流（会返回 `retry-after`，等几分钟恢复）。
 
 ---
 
@@ -98,16 +75,18 @@ curl --cacert $CPA_CA_FILE $OPENAI_BASE_URL/chat/completions \
 
 | 报错 | 原因 | 怎么解决 |
 |---|---|---|
-| `curl: (60) SSL certificate problem` | 证书没装进信任库 | 加 `--cacert ~/.config/cpa/cpa-local-ca.crt`，或重跑初始化脚本 |
+| `Could not resolve host` / ping 不通 | 解析不到我的机器 | 按第 2 步加 hosts，或检查 Tailscale 是否 `Connected` |
+| `Connection refused` / 超时 | 不在 tailnet，或我换了地址 | `tailscale status` 看连接；找我要新地址 |
 | `HTTP 401` / `unauthorized_client` | key 拼错或已被吊销 | 找我确认 key |
-| `Connection refused` / 超时 | 不在 tailnet，或我的 IP 变了 | `tailscale status` 看连接状态；找我要新 IP |
-| 浏览器「您的连接不是私密连接」 | 浏览器没导入证书（Chrome/Firefox 用 NSS 库） | `sudo apt install -y libnss3-tools`（Debian/Ubuntu）后重跑脚本 |
-| `model_not_found` / `not supported when using Codex` | 这个模型不支持你的账号类型 | 换 `luna` / `mini` 之类的档位 |
-| `server_is_overloaded` + `retry-after: 367` | 上游限流了 | 等 `retry-after` 秒；或换个模型再试 |
-| `✓` 之后过一段时间又 401 | 我这边上游凭据被吊销了 | 找我，我重新导入 |
+| `self-signed certificate in certificate chain` | **你用的是旧地址**（IP:8443），不是新域名 | 换回第 1 步那个 `https://….ts.net` 地址 |
+| 浏览器「您的连接不是私密连接」 | 同上，旧地址 | 换成 `https://….ts.net` |
+| `model_not_found` / `not supported when using Codex` | 这个模型不支持我的账号类型 | 先用 `gpt-6-luna`；不要选 `*-image-*`、`*-review`、`*-sol` |
+| `server_is_overloaded` + `retry-after: 367` | 上游额度被打满 | 等 `retry-after` 秒再试，或换个 `gpt-*` 模型 |
+| 昨天好用今天全 401 | 我这边上游凭据被吊销了 | 找我，我重新导入 |
+| GUI 客户端连不上但 curl 正常 | 客户端把地址拼错（多写了 `/v1` 或少写了） | OpenAI 系要 `/v1`，Anthropic 系不要 |
 
 ## 我不会提供的东西
 
 - 管理面板密码（面板只有我能登录）
 - 别人的 key
-- 任何形式的「稳定 SLA」——这是个人自建服务，我随时可能重启、换方案或关停
+- 任何稳定 SLA —— 这是个人自建服务，随时可能重启、换方案或关停
